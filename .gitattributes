@@ -1,0 +1,8 @@
+# repo 內一律以 LF 儲存文字檔。
+# 這很重要：GitHub Actions 的 macOS 執行器會執行 build-ipa.yml 裡的 shell 指令，
+# 若檔案帶著 Windows 的 CRLF，bash 會把 \r 當成指令的一部分而失敗。
+* text=auto eol=lf
+
+# 二進位檔不要做任何換行轉換。
+*.png binary
+*.ipa binary

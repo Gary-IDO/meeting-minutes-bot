@@ -1,0 +1,64 @@
+# XcodeGen 專案描述檔（XcodeGen 2.46+）。
+# GitHub Actions 會執行 `xcodegen generate` 產生 MeetingMinutesBot.xcodeproj，再用 xcodebuild 建置。
+# 若你之後有 Mac，也可以本機 `brew install xcodegen && xcodegen generate` 後用 Xcode 打開。
+name: MeetingMinutesBot
+
+options:
+  bundleIdPrefix: com.meetingminutes
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: false
+  # projectFormat 維持預設（xcode16_0），Xcode 26 可正常開啟與建置。
+
+settings:
+  base:
+    # Swift 5 語言模式 + 最小並行檢查：程式碼以 @MainActor 明確標註，不依賴 Xcode 26 新專案範本的預設隔離。
+    SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: minimal
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+
+targets:
+  MeetingMinutesBot:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: MeetingMinutesBot
+    info:
+      # XcodeGen 每次 generate 都會重寫這個檔案，不要手動編輯；要改權限說明請改這裡。
+      path: Config/Info.plist
+      properties:
+        CFBundleDisplayName: 會議紀錄機器人
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        # 讓錄音在螢幕鎖定 / 切到背景時繼續。
+        UIBackgroundModes:
+          - audio
+        NSMicrophoneUsageDescription: 需要使用麥克風錄下會議內容，並在手機上轉成文字。
+        NSSpeechRecognitionUsageDescription: 在不支援裝置端辨識的機型或系統版本上，會使用 Apple 語音辨識服務將錄音轉成文字。
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        # 讓錄音檔與 meetings.json 出現在「檔案」App → 我的 iPhone → 會議紀錄機器人，方便備份。
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.meetingminutes.bot
+        PRODUCT_NAME: $(TARGET_NAME)
+        TARGETED_DEVICE_FAMILY: "1"          # 只支援 iPhone
+        GENERATE_INFOPLIST_FILE: NO           # 使用上面 info: 產生的 Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_PREVIEWS: YES
+        SWIFT_EMIT_LOC_STRINGS: YES
+        # 在 CI 上不簽章；Sideloadly / AltStore 安裝時會用你的 Apple ID 重新簽章。
+        # 必須放在 target 層級，才能覆蓋 XcodeGen 預設套用的 CODE_SIGN_IDENTITY "iPhone Developer"。
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: ""
+        DEVELOPMENT_TEAM: ""
+    scheme: {}                                # 產生共用 scheme，讓 xcodebuild -scheme 可用

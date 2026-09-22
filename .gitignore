@@ -1,0 +1,17 @@
+# Xcode / XcodeGen
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+build/
+Payload/
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# macOS
+.DS_Store
+
+# Secrets (never commit API keys)
+*.secret
+.env
