@@ -324,8 +324,16 @@ struct MeetingDetailView: View {
                     Text(meeting.transcript)
                         .textSelection(.enabled)
                 }
-                if let url = meeting.audioURL, FileManager.default.fileExists(atPath: url.path) {
+                if meeting.hasUsableTranscript {
                     Divider()
+                    Label(
+                        "逐字稿由單一語言的裝置端辨識產生。台語等方言的段落會被套成發音相近的國語，讀起來通順但內容不對；發現對不上的地方請回聽錄音。",
+                        systemImage: "info.circle"
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(.tertiary)
+                }
+                if let url = meeting.audioURL, FileManager.default.fileExists(atPath: url.path) {
                     Label("錄音檔：\(url.lastPathComponent)（可在「檔案」App → 我的 iPhone → 會議紀錄機器人 → Recordings 找到）", systemImage: "waveform")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
