@@ -67,7 +67,17 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
-            build
+            build 2>&1 | tee xcodebuild.log
+
+      # 建置紀錄要登入 GitHub 才看得到（公開專案也一樣）；編譯失敗時把錯誤行另外列成註記（annotation），
+      # 不登入也能在執行頁面的 Annotations 或公開 API 讀到。一個步驟最多顯示 10 則。
+      - name: Show compile errors
+        if: failure()
+        run: |
+          grep -E "(error|fatal error): " xcodebuild.log \
+            | sed "s|${GITHUB_WORKSPACE}/||" \
+            | sort -u | head -10 \
+            | while IFS= read -r line; do echo "::error::${line}"; done || true
 
       - name: Package unsigned IPA
         run: |
