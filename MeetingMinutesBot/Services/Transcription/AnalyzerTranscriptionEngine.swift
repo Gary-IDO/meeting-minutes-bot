@@ -250,9 +250,10 @@ final class AnalyzerTranscriptionEngine: TranscriptionEngine {
             // 緩衝區滿了：新的這段有進去，但最舊的一段被擠掉，辨識器永遠不會聽到那一段。
             fedFrames += Int64(converted.frameLength)
             droppedBuffers += 1
-            let seconds = old.bufferDuration.seconds
-            if seconds.isFinite {
-                droppedSeconds += seconds
+            // 用音訊本身的長度算（bufferDuration 要 iOS 27 才有，這裡用 iOS 26 就有的 buffer）。
+            let dropped = old.buffer
+            if dropped.format.sampleRate > 0 {
+                droppedSeconds += Double(dropped.frameLength) / dropped.format.sampleRate
             }
         case .terminated:
             // 輸入串流已經關閉（正在結束），這段沒有送出去，不算數。
