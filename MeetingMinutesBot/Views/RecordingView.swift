@@ -92,6 +92,14 @@ struct RecordingView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+
+            // 辨識語言被換成別的地區時一直顯示，不會被其他狀態文字蓋掉。
+            if let warning = session.localeWarning {
+                Text(warning)
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
     }
 
@@ -184,7 +192,9 @@ struct RecordingView: View {
             duration: result.duration,
             audioFileName: result.audioFileName,
             transcript: result.transcript,
-            status: .transcribed
+            status: .transcribed,
+            segments: result.segments.isEmpty ? nil : result.segments,
+            diagnostics: result.diagnostics
         )
         if result.transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             meeting.status = .failed

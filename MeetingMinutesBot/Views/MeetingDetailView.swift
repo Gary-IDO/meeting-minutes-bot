@@ -320,6 +320,33 @@ struct MeetingDetailView: View {
                 if !meeting.hasUsableTranscript {
                     Text("沒有逐字稿內容。")
                         .foregroundStyle(.secondary)
+                } else if let segments = meeting.segments, !segments.isEmpty {
+                    // 分段後長按只能複製一段，所以另外提供整份複製（純逐字稿，不含時間標記與指示）。
+                    Button {
+                        UIPasteboard.general.string = meeting.transcript
+                    } label: {
+                        Label("複製整份逐字稿", systemImage: "doc.on.doc")
+                    }
+                    .buttonStyle(.bordered)
+
+                    if let lost = meeting.diagnostics?.lostAudioSeconds, lost > 0 {
+                        Text("⚠︎ 辨識途中有約 \(Int(lost.rounded(.up))) 秒的音訊沒被辨識到，之後的時間標記可能比錄音早最多這麼多秒。")
+                            .font(.footnote)
+                            .foregroundStyle(.orange)
+                    }
+
+                    // 每段前面標出在錄音裡的時間，方便到錄音檔找到那個位置回聽。
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Text(segment.timeLabel)
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                                Text(segment.text)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
                 } else {
                     Text(meeting.transcript)
                         .textSelection(.enabled)
@@ -337,6 +364,20 @@ struct MeetingDetailView: View {
                     Label("錄音檔：\(url.lastPathComponent)（可在「檔案」App → 我的 iPhone → 會議紀錄機器人 → Recordings 找到）", systemImage: "waveform")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                }
+                if let diagnostics = meeting.diagnostics {
+                    DisclosureGroup("辨識診斷資訊（逐字稿不準時截圖給開發者）") {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(Array(diagnostics.displayRows.enumerated()), id: \.offset) { _, row in
+                                LabeledContent(row.label, value: row.value)
+                            }
+                        }
+                        .font(.caption)
+                        .textSelection(.enabled)
+                        .padding(.top, 4)
+                    }
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)

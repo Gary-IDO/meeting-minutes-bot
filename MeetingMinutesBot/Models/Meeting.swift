@@ -33,6 +33,11 @@ struct Meeting: Identifiable, Codable, Equatable, Hashable {
     var summaryGeneratedAt: Date?
     var lastError: String?
     var status: Status
+    /// 依停頓切好的段落與起始秒數，用來在逐字稿顯示 [分:秒] 對照錄音。
+    /// 舊版存的會議沒有這個欄位，讀進來會是 nil，照舊顯示整份逐字稿。
+    var segments: [TimedSegment]?
+    /// 這場辨識是怎麼跑的（語言、麥克風、丟掉幾段音訊…），用來找逐字稿不準的原因。
+    var diagnostics: RecognitionDiagnostics?
 
     init(
         id: UUID = UUID(),
@@ -45,7 +50,9 @@ struct Meeting: Identifiable, Codable, Equatable, Hashable {
         summaryModel: String? = nil,
         summaryGeneratedAt: Date? = nil,
         lastError: String? = nil,
-        status: Status = .recording
+        status: Status = .recording,
+        segments: [TimedSegment]? = nil,
+        diagnostics: RecognitionDiagnostics? = nil
     ) {
         self.id = id
         self.title = title
@@ -58,6 +65,8 @@ struct Meeting: Identifiable, Codable, Equatable, Hashable {
         self.summaryGeneratedAt = summaryGeneratedAt
         self.lastError = lastError
         self.status = status
+        self.segments = segments
+        self.diagnostics = diagnostics
     }
 
     /// 顯示用標題：使用者沒取名時用日期時間。

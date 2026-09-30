@@ -8,6 +8,10 @@ struct RecordingResult {
     var audioFileName: String?
     var startedAt: Date
     var duration: TimeInterval
+    /// 依停頓切好的段落與起始秒數（沒有時間資訊的引擎為空）
+    var segments: [TimedSegment] = []
+    /// 這次辨識是怎麼跑的，用來找出逐字稿不準的原因
+    var diagnostics: RecognitionDiagnostics?
 }
 
 enum RecordingError: LocalizedError {
@@ -110,6 +114,11 @@ final class RecordingSession {
     private var transcriber: (any TranscriptionEngine)?
     private var tapFormat: AVAudioFormat?
 
+    /// 辨識語言被換成別的地區時顯示在錄音畫面上的警告（nil 表示語言完全相符）。
+    private(set) var localeWarning: String?
+    /// 開始錄音時記下的診斷資訊，結束時補上統計數字後存進會議。
+    private var pendingDiagnostics: RecognitionDiagnostics?
+
     private var tickTask: Task<Void, Never>?
     private var draftTask: Task<Void, Never>?
     private var observers: [NSObjectProtocol] = []
@@ -141,6 +150,8 @@ final class RecordingSession {
         audioFileName = nil
         startedAt = nil
         interruptedWhileRecording = false
+        localeWarning = nil
+        pendingDiagnostics = nil
         sink.meter.reset()
 
         do {
@@ -151,10 +162,14 @@ final class RecordingSession {
             try ensureStillPreparing()
 
             statusDetail = "正在選擇辨識引擎…"
-            let transcriber = try await makeTranscriber(locale: locale)
+            let choice = try await makeTranscriber(locale: locale)
+            let transcriber = choice.engine
             try ensureStillPreparing()
             // 先指派，使用者在下載模型時按取消，cancel() 才能中止它。
             self.transcriber = transcriber
+            if !choice.isExact {
+                localeWarning = "⚠︎ 裝置沒有「\(locale.identifier(.bcp47))」的辨識模型，改用「\(choice.resolved.identifier(.bcp47))」，用字與辨識結果可能不對。"
+            }
 
             // 先啟動辨識引擎（第一次使用可能要下載模型、耗時數分鐘）。
             // 這段時間還沒佔用麥克風、也沒建立錄音檔，使用者按取消時沒有東西要清。
@@ -193,6 +208,28 @@ final class RecordingSession {
             engineName = transcriber.name
             sink.configure(file: audioFile, transcriber: transcriber)
 
+            // 診斷：記下這場錄音實際用的語言、麥克風與收音裝置。統計數字在 stop() 補上。
+            let input = currentInputDescription()
+            pendingDiagnostics = RecognitionDiagnostics(
+                engine: transcriber.name,
+                requestedLocale: locale.identifier(.bcp47),
+                resolvedLocale: choice.resolved.identifier(.bcp47),
+                localeExactMatch: choice.isExact,
+                micFormat: micFormat.diagnosticDescription,
+                analyzerFormat: nil,
+                inputRoute: input.route,
+                inputDataSource: input.dataSource,
+                polarPattern: input.polarPattern,
+                osVersion: ProcessInfo.processInfo.operatingSystemVersionString,
+                dictationSupportsLocale: choice.dictationSupports,
+                failedConversions: nil,
+                droppedBuffers: nil,
+                fedAudioSeconds: nil,
+                lostAudioSeconds: nil,
+                recognizedAudioSeconds: nil,
+                segmentCount: 0
+            )
+
             installTap(format: micFormat)
             engine.prepare()
             try engine.start()
@@ -220,10 +257,14 @@ final class RecordingSession {
         }
     }
 
-    private func makeTranscriber(locale: Locale) async throws -> any TranscriptionEngine {
+    /// 選辨識引擎，並回傳實際採用的語言與是否與設定完全相同（診斷用）。
+    private func makeTranscriber(locale: Locale) async throws
+        -> (engine: any TranscriptionEngine, resolved: Locale, isExact: Bool, dictationSupports: Bool?) {
         if #available(iOS 26, *) {
-            if let supported = await AnalyzerTranscriptionEngine.supportedLocale(matching: locale) {
-                return AnalyzerTranscriptionEngine(locale: supported)
+            if let resolution = await AnalyzerTranscriptionEngine.resolveLocale(for: locale) {
+                let dictation = await AnalyzerTranscriptionEngine.dictationSupports(locale)
+                return (AnalyzerTranscriptionEngine(locale: resolution.locale),
+                        resolution.locale, resolution.isExact, dictation)
             }
         }
         // 備援：SFSpeechRecognizer 需要語音辨識授權。
@@ -232,7 +273,19 @@ final class RecordingSession {
         guard let legacy = LegacyTranscriptionEngine(locale: locale) else {
             throw RecordingError.localeUnsupported
         }
-        return legacy
+        return (legacy, locale, true, nil)
+    }
+
+    /// 目前的收音裝置、麥克風位置與指向性（診斷用）。
+    private func currentInputDescription() -> (route: String, dataSource: String?, polarPattern: String?) {
+        let session = AVAudioSession.sharedInstance()
+        let route = session.currentRoute.inputs
+            .map { "\($0.portName)（\($0.portType.rawValue)）" }
+            .joined(separator: "、")
+        let source = session.inputDataSource
+        return (route.isEmpty ? "—" : route,
+                source?.dataSourceName,
+                source?.selectedPolarPattern?.rawValue)
     }
 
     private func openAudioFile(format micFormat: AVAudioFormat) throws -> AVAudioFile {
@@ -323,15 +376,32 @@ final class RecordingSession {
         sink.closeFile()   // 關檔，寫入 m4a 尾端資訊
 
         var transcript = finalizedTranscript
+        var segments: [TimedSegment] = []
+        var diagnostics = pendingDiagnostics
         if let transcriber {
             let finalText = await withTimeout(seconds: 60) { await transcriber.stop() }
             if let finalText, !finalText.isEmpty {
                 transcript = finalText
+                // 分段只在引擎正常結束時採用，才會跟逐字稿內容一致。
+                segments = transcriber.timedSegments
             } else if !volatileTranscript.isEmpty {
                 transcript = finalizedTranscript + volatileTranscript
             }
+            // 診斷：補上這場辨識的統計數字（就算上面逾時也照樣記，才看得出出了什麼事）。
+            let counters = transcriber.counters
+            if counters.isTracked {
+                // 只有會統計的引擎才寫入數字；備援引擎留空（顯示「此引擎不提供」），不假裝是 0。
+                diagnostics?.analyzerFormat = counters.analyzerFormat
+                diagnostics?.failedConversions = counters.failedConversions
+                diagnostics?.droppedBuffers = counters.droppedBuffers
+                diagnostics?.fedAudioSeconds = counters.fedAudioSeconds
+                diagnostics?.lostAudioSeconds = counters.lostAudioSeconds
+                diagnostics?.recognizedAudioSeconds = counters.recognizedAudioSeconds
+            }
+            diagnostics?.segmentCount = segments.count
         }
         transcriber = nil
+        pendingDiagnostics = nil
         removeDraft()
 
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
@@ -340,7 +410,9 @@ final class RecordingSession {
             transcript: transcript.trimmingCharacters(in: .whitespacesAndNewlines),
             audioFileName: audioFileName,
             startedAt: started,
-            duration: totalDuration
+            duration: totalDuration,
+            segments: segments,
+            diagnostics: diagnostics
         )
         state = .idle
         statusDetail = ""

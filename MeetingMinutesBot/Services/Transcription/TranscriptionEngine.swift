@@ -25,6 +25,24 @@ protocol TranscriptionEngine: AnyObject {
 
     /// 立即放棄，不等結果。
     func cancel()
+
+    /// stop() 之後可讀：依停頓切好的段落與起始秒數。沒有時間資訊的引擎回傳空陣列。
+    var timedSegments: [TimedSegment] { get }
+
+    /// stop() 之後可讀：這場辨識的統計數字（丟掉幾段音訊、送進多少秒等）。
+    var counters: EngineCounters { get }
+}
+
+extension TranscriptionEngine {
+    var timedSegments: [TimedSegment] { [] }
+    var counters: EngineCounters { EngineCounters() }
+}
+
+extension AVAudioFormat {
+    /// 顯示用，例如 "48000 Hz / 1 聲道"
+    var diagnosticDescription: String {
+        "\(Int(sampleRate.rounded())) Hz / \(channelCount) 聲道"
+    }
 }
 
 /// 執行緒安全的 AVAudioConverter 包裝。

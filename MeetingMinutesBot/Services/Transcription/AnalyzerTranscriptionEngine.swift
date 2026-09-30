@@ -21,7 +21,13 @@ final class AnalyzerTranscriptionEngine: TranscriptionEngine {
         }
     }
 
-    let name = "SpeechAnalyzer（iOS 26 裝置端辨識）"
+    /// 兩段確定文字之間停頓超過這麼久（秒）就換段。
+    private static let paragraphGap: Double = 1.5
+    /// 一段超過這麼多字，下一句就換段，確保長時間沒停頓時也有時間標記可以對照錄音。
+    private static let paragraphMaxLength = 300
+
+    /// 顯示實際採用的語言，例如「SpeechAnalyzer 裝置端（zh-TW）」，才看得出有沒有被換成別的地區。
+    var name: String { "SpeechAnalyzer 裝置端（\(locale.identifier(.bcp47))）" }
     let requiresNetwork = false
 
     private let locale: Locale
@@ -30,6 +36,8 @@ final class AnalyzerTranscriptionEngine: TranscriptionEngine {
     // 以下狀態皆受 lock 保護（start() 在背景執行、cancel() 可能從主執行緒同時進來）。
     private var finalized = ""
     private var volatile = ""
+    private var segments: [TimedSegment] = []
+    private var lastFinalEnd: Double?
     private var cancelled = false
     private var inputClosed = false
     private var inputBuilder: AsyncStream<AnalyzerInput>.Continuation?
@@ -39,14 +47,46 @@ final class AnalyzerTranscriptionEngine: TranscriptionEngine {
     private var onUpdate: (@Sendable (String, String) -> Void)?
     private var onStatus: (@Sendable (String) -> Void)?
 
+    // 診斷統計（受 lock 保護）
+    private var analyzerFormatDescription: String?
+    private var analyzerSampleRate: Double = 0
+    private var fedFrames: Int64 = 0
+    private var failedConversions = 0
+    private var droppedBuffers = 0
+    /// 辨識器沒聽到的音訊（秒），分兩種記：
+    /// - failedSeconds：轉換失敗，從來沒交給辨識器（不在 fedFrames 裡）
+    /// - droppedSeconds：已交出去、但在緩衝區裡被擠掉（有算進 fedFrames，要扣回來）
+    private var failedSeconds: Double = 0
+    private var droppedSeconds: Double = 0
+
     init(locale: Locale) {
         self.locale = locale
     }
 
-    /// 檢查裝置硬體與語言是否可用。回傳實際可用的 Locale（可能是同語言的等價區域）。
-    static func supportedLocale(matching locale: Locale) async -> Locale? {
+    // MARK: - 語言
+
+    /// 找出辨識器要用的語言：優先用語言與地區都完全相同的；
+    /// 沒有才退而用 Apple 建議的近似語言（可能是別的地區），並回報不是完全相同，讓畫面能警告。
+    /// Apple 文件原文：沒有完全相同時會回傳「同語言、不同地區」的語言，"This may result in an unexpected transcription"。
+    static func resolveLocale(for requested: Locale) async -> (locale: Locale, isExact: Bool)? {
         guard SpeechTranscriber.isAvailable else { return nil }
-        return await SpeechTranscriber.supportedLocale(equivalentTo: locale)
+        let supported = await SpeechTranscriber.supportedLocales
+        if let exact = supported.first(where: { sameLanguageAndRegion($0, requested) }) {
+            return (exact, true)
+        }
+        guard let near = await SpeechTranscriber.supportedLocale(equivalentTo: requested) else { return nil }
+        return (near, sameLanguageAndRegion(near, requested))
+    }
+
+    /// 只比語言與地區（例如 zh + TW），忽略文字寫法等其他標記，避免 "zh-TW" 與 "zh-Hant-TW" 被誤判為不同。
+    static func sameLanguageAndRegion(_ a: Locale, _ b: Locale) -> Bool {
+        a.language.languageCode == b.language.languageCode && a.region == b.region
+    }
+
+    /// 診斷用：Apple 另一套聽寫模組（DictationTranscriber，支援自訂詞彙與遠距收音提示）支不支援這個語言。
+    static func dictationSupports(_ locale: Locale) async -> Bool {
+        let supported = await DictationTranscriber.supportedLocales
+        return supported.contains { sameLanguageAndRegion($0, locale) }
     }
 
     // MARK: - Start
@@ -112,6 +152,8 @@ final class AnalyzerTranscriptionEngine: TranscriptionEngine {
         }
         inputBuilder = builder
         converter = BufferConverter(outputFormat: analyzerFormat)
+        analyzerFormatDescription = analyzerFormat.diagnosticDescription
+        analyzerSampleRate = analyzerFormat.sampleRate
         // 結果串流：volatile 是同一段話的暫定版本（取代），isFinal 才追加。
         resultsTask = Task { [weak self] in
             do {
@@ -120,7 +162,7 @@ final class AnalyzerTranscriptionEngine: TranscriptionEngine {
                     let text = String(result.text.characters)
                     self.lock.lock()
                     if result.isFinal {
-                        self.finalized += text
+                        self.appendFinal(text, start: result.range.start.seconds, end: result.range.end.seconds)
                         self.volatile = ""
                     } else {
                         self.volatile = text
@@ -138,12 +180,36 @@ final class AnalyzerTranscriptionEngine: TranscriptionEngine {
                 self.lock.lock()
                 let status = self.onStatus
                 self.lock.unlock()
-                status?("辨識引擎中途停止：\(error.localizedDescription)。錄音仍在進行，結束後可用錄音檔重新辨識。")
+                status?("辨識引擎中途停止：\(error.localizedDescription)。錄音仍在進行，錄音檔會完整保留，事後可以回聽。")
             }
         }
         lock.unlock()
 
         try await analyzer.start(inputSequence: stream)
+    }
+
+    /// 把一段確定文字加進逐字稿；停頓夠久或這段已經很長時就換段，並記下起始秒數。
+    /// 呼叫端必須已持有 lock。
+    private func appendFinal(_ text: String, start: Double, end: Double) {
+        let startsNewParagraph: Bool
+        if let last = segments.last {
+            let gapIsLong = start.isFinite && (lastFinalEnd.map { start - $0 > Self.paragraphGap } ?? false)
+            startsNewParagraph = gapIsLong || last.text.count >= Self.paragraphMaxLength
+        } else {
+            startsNewParagraph = true
+        }
+
+        if startsNewParagraph {
+            let segmentStart = start.isFinite ? start : (lastFinalEnd ?? 0)
+            segments.append(TimedSegment(start: segmentStart, text: text))
+            finalized += finalized.isEmpty ? text : "\n" + text
+        } else {
+            segments[segments.count - 1].text += text
+            finalized += text
+        }
+        if end.isFinite {
+            lastFinalEnd = end
+        }
     }
 
     /// start() 每個 await 之後呼叫：cancel() 設定的旗標或 SwiftUI 取消 .task 都會讓啟動流程提早結束。
@@ -162,8 +228,39 @@ final class AnalyzerTranscriptionEngine: TranscriptionEngine {
         let builder = inputBuilder
         let converter = self.converter
         lock.unlock()
-        guard !closed, let builder, let converter, let converted = converter.convert(buffer) else { return }
-        builder.yield(AnalyzerInput(buffer: converted))
+        guard !closed, let builder, let converter else { return }
+
+        guard let converted = converter.convert(buffer) else {
+            // 錄音檔照樣寫進了這段，辨識器卻沒收到：之後的時間標記會比錄音早這麼多。
+            lock.lock()
+            failedConversions += 1
+            if buffer.format.sampleRate > 0 {
+                failedSeconds += Double(buffer.frameLength) / buffer.format.sampleRate
+            }
+            lock.unlock()
+            return
+        }
+        let result = builder.yield(AnalyzerInput(buffer: converted))
+
+        lock.lock()
+        switch result {
+        case .enqueued(_):
+            fedFrames += Int64(converted.frameLength)
+        case .dropped(let old):
+            // 緩衝區滿了：新的這段有進去，但最舊的一段被擠掉，辨識器永遠不會聽到那一段。
+            fedFrames += Int64(converted.frameLength)
+            droppedBuffers += 1
+            let seconds = old.bufferDuration.seconds
+            if seconds.isFinite {
+                droppedSeconds += seconds
+            }
+        case .terminated:
+            // 輸入串流已經關閉（正在結束），這段沒有送出去，不算數。
+            break
+        @unknown default:
+            break
+        }
+        lock.unlock()
     }
 
     /// 標記輸入已關閉並取出 continuation（呼叫端負責 finish()）。回傳 nil 表示已經關過或尚未開啟。
@@ -222,7 +319,14 @@ final class AnalyzerTranscriptionEngine: TranscriptionEngine {
         lock.lock()
         defer { lock.unlock() }
         let leftover = volatile.trimmingCharacters(in: .whitespacesAndNewlines)
-        return leftover.isEmpty ? finalized : finalized + leftover
+        guard !leftover.isEmpty else { return finalized }
+        // 最後一句還沒確定就結束了：當成一般文字補在最後，分段也一起補上，兩邊內容才會一致。
+        if segments.isEmpty {
+            segments.append(TimedSegment(start: lastFinalEnd ?? 0, text: leftover))
+        } else {
+            segments[segments.count - 1].text += leftover
+        }
+        return finalized + leftover
     }
 
     func cancel() {
@@ -237,5 +341,30 @@ final class AnalyzerTranscriptionEngine: TranscriptionEngine {
         if let analyzer {
             Task { await analyzer.cancelAndFinishNow() }
         }
+    }
+
+    // MARK: - 診斷
+
+    var timedSegments: [TimedSegment] {
+        lock.lock()
+        defer { lock.unlock() }
+        return segments
+    }
+
+    var counters: EngineCounters {
+        lock.lock()
+        defer { lock.unlock() }
+        let handedOver = analyzerSampleRate > 0 ? Double(fedFrames) / analyzerSampleRate : 0
+        return EngineCounters(
+            isTracked: true,
+            analyzerFormat: analyzerFormatDescription,
+            failedConversions: failedConversions,
+            droppedBuffers: droppedBuffers,
+            // 交出去的減掉在緩衝區被擠掉的，才是辨識器真正聽到的長度（轉換失敗的本來就沒算進去）。
+            fedAudioSeconds: max(0, handedOver - droppedSeconds),
+            // 兩種丟失都會讓之後的時間標記比錄音早。
+            lostAudioSeconds: failedSeconds + droppedSeconds,
+            recognizedAudioSeconds: lastFinalEnd
+        )
     }
 }
